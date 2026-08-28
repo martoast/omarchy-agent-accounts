@@ -1,0 +1,5 @@
+#!/bin/bash
+# Run claude as the account selected in the bar widget.
+# Named entry point for keybindings and .desktop launchers, which start a
+# command directly and so never source the shell function in ~/.bashrc.
+exec "$HOME/.local/bin/agent-accounts/claude" "$@"

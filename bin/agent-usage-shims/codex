@@ -1,0 +1,33 @@
+#!/bin/bash
+# Codex shim for Omarchy's usage collector.
+#
+# The packaged collector starts the app-server with `-a untrusted`, an
+# approval policy codex-cli dropped (0.150.0 accepts only on-request|never).
+# The app-server therefore never starts and the panel reports "Codex limits
+# unavailable". Rewriting that one flag is the whole fix; every other
+# argument is passed through untouched.
+#
+# This lives in its own directory, which is put on PATH only for collector
+# runs, so an interactive `codex` never goes through here.
+
+set -euo pipefail
+
+args=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  -a | --ask-for-approval)
+    if [[ ${2:-} == "untrusted" ]]; then
+      args+=("$1" "on-request")
+      shift 2
+      continue
+    fi
+    args+=("$1")
+    ;;
+  *) args+=("$1") ;;
+  esac
+  shift
+done
+
+self_dir="$HOME/.local/bin/agent-usage-shims"
+filtered=$(echo "$PATH" | tr ':' '\n' | grep -vxF "$self_dir" | paste -sd:)
+exec env PATH="$filtered" codex "${args[@]+"${args[@]}"}"

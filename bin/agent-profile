@@ -1,0 +1,559 @@
+#!/bin/bash
+# Manage numbered accounts for a coding-agent CLI.
+#
+# One account is one config directory: its own sign-in, its own transcripts,
+# its own rate limits. account1 is the CLI's original directory, so nothing
+# had to move for it; account2 and up live beside it in a profiles folder and
+# are selected with the agent's own home variable.
+#
+#   claude1 / claude2 / codex1 …   run a specific account
+#   claude / codex                 run whichever account is selected
+#
+# Selection is shared with the Omarchy agents widget: the panel writes the tab
+# you leave it on, and each CLI follows the most recent selection belonging to
+# it, so switching to a Claude tab never changes which Codex account runs.
+#
+# Invoked as `claude-profile` or `codex-profile`, which set AGENT_KIND.
+
+set -euo pipefail
+
+AGENT="${AGENT_KIND:-}"
+[[ -n $AGENT ]] || { echo "agent-profile: run this as claude-profile or codex-profile" >&2; exit 2; }
+
+BIN_DIR="$HOME/.local/bin"
+DISPATCH_DIR="$BIN_DIR/agent-accounts"
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents"
+SELECTION_FILE="$STATE_DIR/selected"
+DEFAULTS_FILE="$STATE_DIR/defaults.json"
+
+case "$AGENT" in
+claude)
+  LABEL="Claude"
+  CLI="claude"
+  PRIMARY_DIR="$HOME/.claude"
+  PROFILES_DIR="${CLAUDE_PROFILES_DIR:-$HOME/.claude-profiles}"
+  HOME_VAR="CLAUDE_CONFIG_DIR"
+  SHARED_ITEMS=(settings.json skills plugins)
+  SHARE_MEMORY=1
+  CREDS_FILE=".credentials.json"
+  INIT_FILE=".claude.json"
+  LOGIN_ARGS=(auth login)
+  LOGOUT_ARGS=(auth logout)
+  ;;
+codex)
+  LABEL="Codex"
+  CLI="codex"
+  PRIMARY_DIR="$HOME/.codex"
+  PROFILES_DIR="${CODEX_PROFILES_DIR:-$HOME/.codex-profiles}"
+  HOME_VAR="CODEX_HOME"
+  SHARED_ITEMS=(config.toml skills AGENTS.md packages)
+  SHARE_MEMORY=0
+  CREDS_FILE="auth.json"
+  INIT_FILE="auth.json"
+  LOGIN_ARGS=(login)
+  LOGOUT_ARGS=(logout)
+  ;;
+*)
+  echo "agent-profile: unknown agent '$AGENT'" >&2
+  exit 2
+  ;;
+esac
+
+REAL_CLI="$CLI-real"
+
+fail() {
+  echo "$CLI-profile: $*" >&2
+  exit 1
+}
+
+# ------------------------------------------------------------ account model
+
+is_primary() { [[ $1 == "account1" ]]; }
+valid_name() { [[ $1 =~ ^account[1-9][0-9]*$ ]] || fail "account names are account1, account2, …: got '$1'"; }
+
+# "2", "account2" and "claude2" all name the same account.
+normalize_name() {
+  local raw="${1:-}"
+  raw=${raw#"$CLI"}
+  raw=${raw#account}
+  [[ $raw =~ ^[1-9][0-9]*$ ]] || fail "not an account: '${1:-}' (use 1, 2, account2, …)"
+  echo "account$raw"
+}
+
+account_number() { echo "${1#account}"; }
+profile_dir() { if is_primary "$1"; then echo "$PRIMARY_DIR"; else echo "$PROFILES_DIR/$1"; fi; }
+
+# The panel keys a tab on this id and resolves its mark as assets/<id>.svg.
+provider_id() { echo "$AGENT-$1"; }
+display_name() { echo "$LABEL $(account_number "$1")"; }
+
+all_profiles() {
+  echo "account1"
+  [[ -d $PROFILES_DIR ]] || return 0
+  local dir name
+  for dir in "$PROFILES_DIR"/*/; do
+    [[ -d $dir ]] || continue
+    name=$(basename "$dir")
+    [[ $name =~ ^account[2-9][0-9]*$ ]] && echo "$name"
+  done
+}
+
+json_field() {
+  [[ -f $1 ]] || return 0
+  jq -r "$2 // empty" "$1" 2>/dev/null || true
+}
+
+# Claude keeps .claude.json inside CLAUDE_CONFIG_DIR when that is set, so
+# account1 — which runs without it — keeps its copy at ~/.claude.json.
+claude_state_file() {
+  if is_primary "$1" && [[ -f $HOME/.claude.json ]]; then
+    echo "$HOME/.claude.json"
+  else
+    echo "$(profile_dir "$1")/.claude.json"
+  fi
+}
+
+# Codex stores no plaintext account details; the signed-in address is a claim
+# inside the id token it saved. Only that claim is read, and only locally.
+codex_email() {
+  local auth="$(profile_dir "$1")/auth.json" token payload pad
+  [[ -f $auth ]] || return 0
+  token=$(jq -r '.. | strings | select(test("^ey[A-Za-z0-9_-]+\\.[A-Za-z0-9_-]+\\."))' "$auth" 2>/dev/null | head -1)
+  [[ -n $token ]] || return 0
+  payload=$(cut -d. -f2 <<<"$token")
+  pad=$(((4 - ${#payload} % 4) % 4))
+  payload="$payload$(printf '=%.0s' $(seq 0 $((pad - 1)) 2>/dev/null))"
+  tr '_-' '/+' <<<"$payload" | base64 -d 2>/dev/null | jq -r '.email // empty' 2>/dev/null || true
+}
+
+profile_email() {
+  case "$AGENT" in
+  claude) json_field "$(claude_state_file "$1")" '.oauthAccount.emailAddress' ;;
+  codex) codex_email "$1" ;;
+  esac
+}
+
+# The plan is whatever the last usage record reported; for Claude it is also
+# recoverable straight from the credential file.
+profile_plan() {
+  local record="$STATE_DIR/usage/$(provider_id "$1").json" tier sub creds
+  if [[ $AGENT == "claude" ]]; then
+    creds="$(profile_dir "$1")/.credentials.json"
+    tier=$(json_field "$creds" '.claudeAiOauth.rateLimitTier')
+    sub=$(json_field "$creds" '.claudeAiOauth.subscriptionType')
+    if [[ $tier =~ max_([0-9]+x) ]]; then
+      echo "Max ${BASH_REMATCH[1]}"
+      return 0
+    elif [[ -n $sub ]]; then
+      echo "${sub^}"
+      return 0
+    fi
+  fi
+  tier=$(json_field "$record" '.tierLabel')
+  [[ -n $tier ]] && echo "${tier^}"
+}
+
+profile_logged_in() {
+  local creds="$(profile_dir "$1")/$CREDS_FILE"
+  [[ -s $creds ]] || return 1
+  case "$AGENT" in
+  claude) [[ -n $(json_field "$creds" '.claudeAiOauth.accessToken') ]] ;;
+  codex) [[ -n $(json_field "$creds" '.auth_mode') || -n $(json_field "$creds" '.OPENAI_API_KEY') ]] ;;
+  esac
+}
+
+profile_initialized() {
+  local dir
+  dir=$(profile_dir "$1")
+  [[ -f $dir/$INIT_FILE ]] && return 0
+  [[ $AGENT == "claude" ]] && is_primary "$1" && [[ -f $HOME/.claude.json ]] && return 0
+  return 1
+}
+
+# ---------------------------------------------------------------- selection
+
+# Which account this CLI starts. Kept apart from the panel's selected tab on
+# purpose: reading another account's usage should not silently change what
+# `claude` runs. The panel moves it with `d`; this command moves it with `use`.
+read_selection() {
+  local name=""
+  if [[ -f $DEFAULTS_FILE ]]; then
+    name=$(jq -r --arg a "$AGENT" '.[$a] // empty' "$DEFAULTS_FILE" 2>/dev/null || true)
+    name=${name#"$AGENT-"}
+  fi
+  if [[ $name =~ ^account[1-9][0-9]*$ ]] && [[ -d $(profile_dir "$name") ]]; then
+    echo "$name"
+  else
+    echo "account1"
+  fi
+}
+
+write_selection() {
+  local name="$1" tmp
+  mkdir -p "$STATE_DIR"
+  [[ -s $DEFAULTS_FILE ]] || echo '{}' >"$DEFAULTS_FILE"
+  tmp=$(mktemp "$STATE_DIR/.defaults.XXXXXX")
+  if jq --arg a "$AGENT" --arg id "$(provider_id "$name")" '.[$a] = $id' "$DEFAULTS_FILE" >"$tmp" 2>/dev/null; then
+    mv "$tmp" "$DEFAULTS_FILE"
+  else
+    rm -f "$tmp"
+    printf '{"%s":"%s"}\n' "$AGENT" "$(provider_id "$name")" >"$DEFAULTS_FILE"
+  fi
+  # Move the panel to the account that was just made default, so the widget
+  # agrees with what the command line just said.
+  printf '%s\n' "$(provider_id "$name")" >"$SELECTION_FILE.tmp" && mv "$SELECTION_FILE.tmp" "$SELECTION_FILE"
+}
+
+cmd_use() {
+  local name
+  name=$(normalize_name "${1:-}")
+  [[ -d $(profile_dir "$name") ]] || fail "no such account: $name"
+  write_selection "$name"
+  local email
+  email=$(profile_email "$name" || true)
+  echo "$CLI now runs $name${email:+ ($email)}"
+}
+
+cmd_selected() { read_selection; }
+
+# ----------------------------------------------------------------- sharing
+
+link_shared() {
+  local name="$1" dir target source item
+  dir=$(profile_dir "$name")
+  is_primary "$name" || mkdir -p "$dir"
+  if ! is_primary "$name"; then
+    for item in "${SHARED_ITEMS[@]}"; do
+      source="$PRIMARY_DIR/$item"
+      target="$dir/$item"
+      [[ -e $source ]] || continue
+      # A real file here means the CLI replaced the symlink on an atomic write.
+      if [[ -L $target ]]; then
+        [[ $(readlink "$target") == "$source" ]] && continue
+        rm -f "$target"
+      elif [[ -e $target ]]; then
+        mv "$target" "$target.unshared.$(date +%s)"
+        echo "$CLI-profile: kept the account's own $item as $item.unshared.*" >&2
+      fi
+      ln -s "$source" "$target"
+    done
+    ((SHARE_MEMORY)) && link_memory "$name"
+  fi
+  link_widget_icon "$name"
+}
+
+# Memory lives under projects/<slug>/memory, and projects/ has to stay
+# per-account for usage attribution — so memory is linked one slug at a time
+# rather than sharing the whole tree.
+link_memory() {
+  local name="$1" dir source target slug
+  dir=$(profile_dir "$name")
+  [[ -d $PRIMARY_DIR/projects ]] || return 0
+  for source in "$PRIMARY_DIR"/projects/*/memory; do
+    [[ -d $source ]] || continue
+    slug=$(basename "$(dirname "$source")")
+    target="$dir/projects/$slug/memory"
+    [[ -e $target || -L $target ]] && continue
+    mkdir -p "$(dirname "$target")"
+    ln -s "$source" "$target"
+  done
+}
+
+# The panel resolves a tab's mark as assets/<id>.svg inside its own plugin
+# directory. The packaged plugin is read-only, which is why the widget runs
+# from a clone; these aliases are the only assets the clone adds.
+agents_clone_dir() {
+  local manifest dir
+  for manifest in "$HOME"/.config/omarchy/plugins/*/manifest.json; do
+    [[ -f $manifest ]] || continue
+    [[ $(json_field "$manifest" '.omarchy.clonedFrom') == "omarchy.agents" ]] || continue
+    dir=$(dirname "$manifest")
+    echo "$dir"
+    return 0
+  done
+  return 1
+}
+
+link_widget_icon() {
+  local name="$1" clone mark
+  clone=$(agents_clone_dir) || return 0
+  for mark in "$AGENT.svg" "$AGENT-light.svg"; do
+    [[ -f $clone/assets/$mark ]] || continue
+    ln -sfn "$mark" "$clone/assets/$(provider_id "$name")${mark#"$AGENT"}"
+  done
+}
+
+# --------------------------------------------------------------- launchers
+
+write_launcher() {
+  local name="$1" num path
+  num=$(account_number "$name")
+  path="$BIN_DIR/$CLI$num"
+  mkdir -p "$BIN_DIR"
+  cat >"$path" <<LAUNCHER
+#!/bin/bash
+# Run $LABEL as $name. Generated by $CLI-profile.
+exec $CLI-profile run $name "\$@"
+LAUNCHER
+  chmod +x "$path"
+  echo "$path"
+}
+
+# ------------------------------------------------------------------- verbs
+
+cmd_add() {
+  local name="" login=1 arg
+  for arg in "$@"; do
+    case "$arg" in
+    --no-login) login=0 ;;
+    -*) fail "unknown option: $arg" ;;
+    *) name=$(normalize_name "$arg") ;;
+    esac
+  done
+  [[ -n $name ]] || fail "usage: $CLI-profile add <n> [--no-login]"
+  valid_name "$name"
+  is_primary "$name" && fail "account1 already exists as $PRIMARY_DIR"
+  local dir="$PROFILES_DIR/$name"
+  [[ -d $dir ]] && fail "$name already exists at $dir"
+
+  mkdir -p "$dir"
+  link_shared "$name"
+  local launcher
+  launcher=$(write_launcher "$name")
+  echo "Created $name at $dir"
+  echo "Launcher: $launcher"
+  if ((login)); then
+    echo
+    cmd_login "$name"
+  else
+    echo "Sign it in with: $CLI-profile login $(account_number "$name")"
+  fi
+}
+
+cmd_link() {
+  local name
+  name=$(normalize_name "${1:-}")
+  [[ -d $(profile_dir "$name") ]] || fail "no such account: $name"
+  link_shared "$name"
+  write_launcher "$name" >/dev/null
+  echo "Relinked shared config for $name"
+}
+
+cmd_run() {
+  local name
+  name=$(normalize_name "${1:-}")
+  shift
+  local dir
+  dir=$(profile_dir "$name")
+  [[ -d $dir ]] || fail "no such account: $name (try: $CLI-profile add $(account_number "$name"))"
+
+  # AGENT_ACCOUNT tells the dispatcher that this process already belongs to an
+  # account, so a nested call inside a session stays on the one that started it.
+  if is_primary "$name"; then
+    # account1 is the CLI's own default layout: pointing the home variable at
+    # it would relocate state the CLI keeps outside that directory.
+    exec env -u "$HOME_VAR" "${AGENT^^}_ACCOUNT=$(account_number "$name")" "$REAL_CLI" "$@"
+  fi
+  exec env "$HOME_VAR=$dir" "${AGENT^^}_ACCOUNT=$(account_number "$name")" "$REAL_CLI" "$@"
+}
+
+cmd_login() {
+  local name
+  name=$(normalize_name "${1:-1}")
+  local dir
+  dir=$(profile_dir "$name")
+  [[ -d $dir ]] || fail "no such account: $name"
+  if is_primary "$name"; then
+    env -u "$HOME_VAR" "$REAL_CLI" "${LOGIN_ARGS[@]}"
+  else
+    env "$HOME_VAR=$dir" "$REAL_CLI" "${LOGIN_ARGS[@]}"
+  fi
+  echo
+  cmd_list
+}
+
+cmd_logout() {
+  local name
+  name=$(normalize_name "${1:-}")
+  local dir
+  dir=$(profile_dir "$name")
+  [[ -d $dir ]] || fail "no such account: $name"
+  if is_primary "$name"; then
+    env -u "$HOME_VAR" "$REAL_CLI" "${LOGOUT_ARGS[@]}"
+  else
+    env "$HOME_VAR=$dir" "$REAL_CLI" "${LOGOUT_ARGS[@]}"
+  fi
+}
+
+cmd_list() {
+  local selected
+  selected=$(read_selection)
+  printf '%-3s %-10s %-30s %-10s %-10s %s\n' "" ACCOUNT EMAIL PLAN "SIGNED IN" COMMAND
+  local name email plan signed mark
+  while read -r name; do
+    [[ -n $name ]] || continue
+    email=$(profile_email "$name" || true); [[ -n $email ]] || email="-"
+    plan=$(profile_plan "$name" || true); [[ -n $plan ]] || plan="-"
+    if profile_logged_in "$name"; then signed="yes"; else signed="no"; fi
+    if [[ $name == "$selected" ]]; then mark="->"; else mark="  "; fi
+    printf '%-3s %-10s %-30s %-10s %-10s %s\n' \
+      "$mark" "$name" "$email" "$plan" "$signed" "$CLI$(account_number "$name")"
+  done < <(all_profiles)
+  echo
+  echo "-> is what a bare \`$CLI\` runs. Press d on its tab in the bar widget, or: $CLI-profile use <n>"
+}
+
+cmd_usage() {
+  omarchy-agent-usage-profiles "$@"
+  echo "Refreshed agent usage records"
+}
+
+cmd_doctor() {
+  local name dir item target problems=0 clone num
+  echo "$LABEL account1: $PRIMARY_DIR"
+  clone=$(agents_clone_dir) || { echo "  no cloned agents widget found"; problems=$((problems + 1)); }
+  while read -r name; do
+    [[ -n $name ]] || continue
+    dir=$(profile_dir "$name")
+    num=$(account_number "$name")
+    if ! is_primary "$name"; then
+      for item in "${SHARED_ITEMS[@]}"; do
+        [[ -e $PRIMARY_DIR/$item ]] || continue
+        target="$dir/$item"
+        if [[ ! -L $target ]]; then
+          echo "  $name: $item is not shared (expected a symlink to account1)"
+          problems=$((problems + 1))
+        elif [[ ! -e $target ]]; then
+          echo "  $name: $item is a broken symlink"
+          problems=$((problems + 1))
+        fi
+      done
+    fi
+    [[ -x $BIN_DIR/$CLI$num ]] || { echo "  $name: launcher $CLI$num is missing"; problems=$((problems + 1)); }
+    if [[ -n ${clone:-} && -f $clone/assets/$AGENT.svg && ! -e $clone/assets/$(provider_id "$name").svg ]]; then
+      echo "  $name: widget icon alias is missing"
+      problems=$((problems + 1))
+    fi
+    profile_logged_in "$name" || { echo "  $name: not signed in"; problems=$((problems + 1)); }
+  done < <(all_profiles)
+
+  [[ -x $BIN_DIR/$REAL_CLI ]] || { echo "  $REAL_CLI is missing"; problems=$((problems + 1)); }
+  [[ -x $DISPATCH_DIR/$CLI ]] || { echo "  dispatcher $DISPATCH_DIR/$CLI is missing"; problems=$((problems + 1)); }
+  # The dispatcher is wired up as a shell function, which this non-interactive
+  # process cannot see; check the line that defines it instead.
+  if ! grep -q 'agent-accounts/\$_agent_cli' "$HOME/.bashrc" 2>/dev/null; then
+    echo "  ~/.bashrc no longer defines the \`$CLI\` dispatcher function"
+    problems=$((problems + 1))
+  fi
+
+  if ((problems == 0)); then
+    echo "Everything looks healthy."
+  else
+    echo
+    echo "Run '$CLI-profile link <n>' to repair sharing, or '$CLI-profile widget-sync' for the widget."
+    return 1
+  fi
+}
+
+# omarchy update replaces the packaged plugin, and the clone does not follow.
+# Refresh it from upstream, then re-apply what the clone adds: its own id, the
+# selection bridge, and every account's mark alias.
+cmd_widget_sync() {
+  local clone upstream="${OMARCHY_PATH:-/usr/share/omarchy}/shell/plugins/agents" id tmp name kind
+  clone=$(agents_clone_dir) || fail "no cloned agents plugin found (run: omarchy plugin clone omarchy.agents)"
+  [[ -d $upstream ]] || fail "packaged agents plugin not found at $upstream"
+  id=$(json_field "$clone/manifest.json" '.id')
+  [[ -n $id ]] || fail "clone at $clone has no id"
+
+  rm -rf "$clone.new"
+  cp -aL "$upstream/." "$clone.new/"
+  tmp=$(mktemp)
+  jq --arg id "$id" '.id = $id | .omarchy.clonedFrom = "omarchy.agents"' \
+    "$clone.new/manifest.json" >"$tmp" && mv "$tmp" "$clone.new/manifest.json"
+
+  if ! agent-widget-patch "$clone.new"; then
+    rm -rf "$clone.new"
+    fail "could not re-apply the account patches to the new plugin — the clone was left untouched"
+  fi
+
+  rm -rf "$clone.old" && mv "$clone" "$clone.old" && mv "$clone.new" "$clone"
+  rm -rf "$clone.old"
+
+  # Every agent's aliases, not just this one's — the clone is shared.
+  for kind in claude codex; do
+    command -v "$kind-profile" >/dev/null || continue
+    AGENT_KIND="$kind" "$kind-profile" relink-icons || true
+  done
+  echo "Resynced $id from $upstream"
+}
+
+cmd_relink_icons() {
+  local name
+  while read -r name; do
+    [[ -n $name ]] || continue
+    link_widget_icon "$name"
+  done < <(all_profiles)
+}
+
+cmd_remove() {
+  local name
+  name=$(normalize_name "${1:-}")
+  is_primary "$name" && fail "account1 is the original $PRIMARY_DIR and is not removable here"
+  local dir="$PROFILES_DIR/$name" clone
+  [[ -d $dir ]] || fail "no such account: $name"
+  echo "This deletes $dir (sign-in and history for that account)."
+  read -r -p "Remove $name? [y/N] " reply
+  [[ $reply == [yY]* ]] || { echo "Cancelled."; return 1; }
+  rm -rf "$dir"
+  rm -f "$BIN_DIR/$CLI$(account_number "$name")"
+  rm -f "$STATE_DIR/usage/$(provider_id "$name").json"
+  clone=$(agents_clone_dir) && rm -f "$clone/assets/$(provider_id "$name")"*.svg
+  [[ $(read_selection) == "$name" ]] && write_selection "account1"
+  echo "Removed $name"
+}
+
+usage() {
+  cat <<HELP
+Run several $LABEL accounts side by side, each with its own limits.
+
+  ${CLI}1, ${CLI}2, …$(printf '%*s' $((14 - ${#CLI})) '')Run a specific account
+  $CLI$(printf '%*s' $((30 - ${#CLI})) '')Run whichever account is selected
+
+  $CLI-profile list            Accounts, emails, plans, and which is selected
+  $CLI-profile use <n>         Select the account a bare \`$CLI\` runs
+  $CLI-profile selected        Print the selected account
+  $CLI-profile add <n>         Create an account and sign it in
+  $CLI-profile run <n> [args]  Run $LABEL as that account
+  $CLI-profile login <n>       Sign an account in (or back in)
+  $CLI-profile logout <n>      Sign an account out
+  $CLI-profile link <n>        Repair shared config
+  $CLI-profile doctor          Check the whole setup
+  $CLI-profile usage [--force] Refresh the bar widget's usage records
+  $CLI-profile widget-sync     Refresh the cloned bar widget from upstream
+  $CLI-profile remove <n>      Delete an account
+
+In the bar widget, a dot marks the account a bare \`$CLI\` starts; press d on
+any tab to move it there. Browsing the other tabs does not change it, and each
+agent keeps its own default.
+HELP
+}
+
+command="${1:-list}"
+[[ $# -gt 0 ]] && shift || true
+case "$command" in
+list | ls) cmd_list "$@" ;;
+use | select | default) cmd_use "$@" ;;
+selected | current) cmd_selected "$@" ;;
+add | new) cmd_add "$@" ;;
+run | exec) cmd_run "$@" ;;
+login) cmd_login "$@" ;;
+logout) cmd_logout "$@" ;;
+link | relink) cmd_link "$@" ;;
+relink-icons) cmd_relink_icons "$@" ;;
+doctor | check) cmd_doctor "$@" ;;
+usage | refresh) cmd_usage "$@" ;;
+widget-sync | widget) cmd_widget_sync "$@" ;;
+remove | rm | delete) cmd_remove "$@" ;;
+-h | --help | help) usage ;;
+*) fail "unknown command: $command (try --help)" ;;
+esac

@@ -1,0 +1,6 @@
+#!/bin/bash
+# Exec the real codex binary, skipping the account dispatcher.
+set -euo pipefail
+self_dir="$HOME/.local/bin/agent-accounts"
+filtered=$(echo "$PATH" | tr ':' '\n' | grep -vxF "$self_dir" | paste -sd:)
+exec env PATH="$filtered" codex "$@"

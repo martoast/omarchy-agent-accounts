@@ -1,0 +1,15 @@
+#!/bin/bash
+# Regenerate every agent usage record: Omarchy's own, then the per-account
+# Claude ones.
+#
+# The agents widget calls this instead of omarchy-agent-usage-update, so the
+# extra accounts refresh on exactly the same schedule and the same keypress
+# as everything else, and the panel never redraws against a half-updated set.
+# Arguments are the updater's own and are passed through to both halves.
+
+set -uo pipefail
+
+status=0
+omarchy-agent-usage-update "$@" || status=1
+omarchy-agent-usage-profiles "$@" || status=1
+exit $status

@@ -1,0 +1,19 @@
+#!/bin/bash
+# Start claude as the account selected in the bar widget.
+#
+# This shadows the real `claude` on PATH. It only chooses an account and hands
+# off — every argument, exit code and stream belongs to the real CLI.
+
+set -euo pipefail
+
+# Already inside an account: a nested call (the agent running a command that
+# invokes it again) must stay on the account that started it, not jump to
+# whatever the widget is showing now.
+if [[ -n ${CLAUDE_ACCOUNT:-} || -n ${CLAUDE_CONFIG_DIR:-} ]]; then
+  exec claude-real "$@"
+fi
+
+# Anything unexpected here would strand the user without a CLI, so a broken
+# selection falls back to account1 rather than failing.
+account=$(claude-profile selected 2>/dev/null || echo account1)
+exec claude-profile run "$account" "$@"

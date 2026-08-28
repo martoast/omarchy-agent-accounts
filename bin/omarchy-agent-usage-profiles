@@ -1,0 +1,154 @@
+#!/bin/bash
+# Write one agents-panel usage record per account, for every agent that has
+# more than one config directory to report on.
+#
+# The panel reads whatever JSON records live in its usage directory, whoever
+# wrote them, so a second subscription only needs a second record. Omarchy's
+# updater runs one collector per agent, with no notion of accounts, so this
+# runs those same collectors once per account and relabels their output.
+#
+# Each run is pinned to one account and nothing else. The agent's home
+# variable picks the sign-in and history; beyond that only what an agent
+# actually needs is overridden, so nothing is scanned into the wrong account.
+
+set -uo pipefail
+
+USAGE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/omarchy/agents/usage"
+CACHE_ROOT="${XDG_CACHE_HOME:-$HOME/.cache}/omarchy/agent-accounts"
+OMARCHY_BIN="${OMARCHY_PATH:-/usr/share/omarchy}/bin"
+SHIM_DIR="$HOME/.local/bin/agent-usage-shims"
+
+AGENTS=(claude codex)
+
+mkdir -p "$USAGE_DIR"
+
+# The widget passes the updater's own arguments through: pass-through flags,
+# --except for a provider switched off in settings, and bare provider ids
+# when only some of them need rerunning.
+flags=()
+only=()
+declare -A excluded
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+  --force | --limits-only) flags+=("$1") ;;
+  --except)
+    excluded[${2:-}]=1
+    shift
+    ;;
+  -*) ;;
+  *) only+=("$1") ;;
+  esac
+  shift
+done
+
+wanted() {
+  local id="$1"
+  [[ -n ${excluded[$id]:-} ]] && return 1
+  ((${#only[@]} == 0)) && return 0
+  local candidate
+  for candidate in "${only[@]}"; do
+    [[ $candidate == "$id" ]] && return 0
+  done
+  return 1
+}
+
+agent_label() { case "$1" in claude) echo "Claude" ;; codex) echo "Codex" ;; esac; }
+primary_dir() { case "$1" in claude) echo "$HOME/.claude" ;; codex) echo "$HOME/.codex" ;; esac; }
+profiles_dir() { case "$1" in claude) echo "$HOME/.claude-profiles" ;; codex) echo "$HOME/.codex-profiles" ;; esac; }
+home_var() { case "$1" in claude) echo "CLAUDE_CONFIG_DIR" ;; codex) echo "CODEX_HOME" ;; esac; }
+login_hint() { case "$1" in claude) echo "claude auth login" ;; codex) echo "codex login" ;; esac; }
+
+accounts_for() {
+  local agent="$1" dir name
+  echo "account1"
+  dir=$(profiles_dir "$agent")
+  [[ -d $dir ]] || return 0
+  for sub in "$dir"/*/; do
+    [[ -d $sub ]] || continue
+    name=$(basename "$sub")
+    [[ $name =~ ^account[2-9][0-9]*$ ]] && echo "$name"
+  done
+}
+
+account_dir() {
+  local agent="$1" name="$2"
+  if [[ $name == "account1" ]]; then primary_dir "$agent"; else echo "$(profiles_dir "$agent")/$name"; fi
+}
+
+write_record() {
+  local target="$1" record="$2" tmp
+  tmp=$(mktemp "$USAGE_DIR/.$target.XXXXXX") || return 1
+  printf '%s\n' "$record" >"$tmp" && mv "$tmp" "$USAGE_DIR/$target.json"
+}
+
+collect() {
+  local agent="$1" name="$2" dir="$3"
+  local number="${name#account}" record collector cache
+  collector="$OMARCHY_BIN/omarchy-agent-usage-$agent"
+  cache="$CACHE_ROOT/$agent/$name"
+  [[ -x $collector ]] || { echo "omarchy-agent-usage-profiles: missing $collector" >&2; return 1; }
+  mkdir -p "$cache/home"
+
+  case "$agent" in
+  claude)
+    # HOME is redirected so the collector's home-relative scans (pi/omp
+    # sessions, which belong to no single subscription) are not counted into
+    # every account, and XDG_CACHE_HOME so the two accounts do not share one
+    # limits-probe cache.
+    record=$(
+      HOME="$cache/home" \
+        CLAUDE_CONFIG_DIR="$dir" \
+        XDG_CACHE_HOME="$cache" \
+        XDG_DATA_HOME="$cache/home/.local/share" \
+        "$collector" "${flags[@]+"${flags[@]}"}"
+    )
+    ;;
+  codex)
+    # Codex reaches its plan and limits by starting a real app-server, which
+    # needs the true HOME. Its scan cache is already keyed by CODEX_HOME, so
+    # that variable alone separates the accounts. The shim directory is on
+    # PATH only here, to correct one flag the packaged collector still passes.
+    record=$(
+      CODEX_HOME="$dir" \
+        PATH="$SHIM_DIR:$PATH" \
+        "$collector" "${flags[@]+"${flags[@]}"}"
+    )
+    ;;
+  esac
+
+  [[ -n ${record:-} ]] || { echo "omarchy-agent-usage-profiles: $agent collector failed for $name" >&2; return 1; }
+
+  # The id is what the panel keys a tab on and how it resolves the tab's mark;
+  # the name is what it prints. The collector's auth advice names the plain
+  # CLI, which would sign the wrong account back in.
+  record=$(jq -c \
+    --arg id "$agent-$name" \
+    --arg label "$(agent_label "$agent") $number" \
+    --arg hint "$(login_hint "$agent")" \
+    --arg login "$agent-profile login $number" \
+    '.id = $id
+     | .name = $label
+     | if .authHelpText? then .authHelpText |= gsub($hint; $login) else . end' \
+    <<<"$record") || return 1
+
+  write_record "$agent-$name" "$record"
+}
+
+status=0
+pids=()
+for agent in "${AGENTS[@]}"; do
+  [[ -x "$OMARCHY_BIN/omarchy-agent-usage-$agent" ]] || continue
+  while read -r name; do
+    [[ -n $name ]] || continue
+    wanted "$agent-$name" || continue
+    dir=$(account_dir "$agent" "$name")
+    [[ -d $dir ]] || continue
+    collect "$agent" "$name" "$dir" &
+    pids+=($!)
+  done < <(accounts_for "$agent")
+done
+
+for pid in "${pids[@]+"${pids[@]}"}"; do
+  wait "$pid" || status=1
+done
+exit $status

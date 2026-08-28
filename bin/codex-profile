@@ -1,0 +1,3 @@
+#!/bin/bash
+# Manage codex accounts. Thin wrapper around agent-profile.
+AGENT_KIND=codex exec agent-profile "$@"

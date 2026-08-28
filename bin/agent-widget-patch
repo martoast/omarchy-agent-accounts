@@ -1,0 +1,212 @@
+#!/usr/bin/env python3
+"""Apply the account-management patches to a cloned Omarchy agents plugin.
+
+None of this can live in the packaged plugin, because /usr/share/omarchy is
+read-only and replaced on every update. Four small, separately anchored edits:
+
+  Panel.qml  a bridge between the panel and two state files: the tab being
+             viewed, and the default account each CLI starts. Adds a `d` key
+             to move the default, a dot on the default account's chip, and a
+             line under the hero saying which is which.
+
+  Main.qml   route the refresh through omarchy-agent-usage-all, so extra
+             accounts regenerate on the same timer and the same refresh key
+             as everything else.
+
+Idempotent, and safe to run against freshly copied upstream files.
+"""
+
+import sys
+import pathlib
+
+MARKER = "claude-profile"
+
+PANEL_ANCHOR = "  property bool cursorActive: false"
+
+PANEL_BRIDGE = '''
+  // --- claude-profile account bridge (not upstream) ---
+  // The tab currently being viewed. `claude-profile use` writes it to move
+  // the panel; the panel writes it back when you switch tabs. Writes are
+  // suppressed when the value already matches, so neither side chases the
+  // other.
+  FileView {
+    id: accountSelectionFile
+    path: (Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state") + "/omarchy/agents/selected"
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      var id = String(text() || "").trim()
+      if (id !== "" && id !== root.selectedProviderId) root.selectedProviderId = id
+    }
+  }
+
+  onSelectedProviderIdChanged: {
+    if (root.selectedProviderId === "") return
+    if (String(accountSelectionFile.text() || "").trim() === root.selectedProviderId) return
+    accountSelectionFile.setText(root.selectedProviderId + "\\n")
+  }
+
+  // Which account each CLI actually starts, one entry per agent:
+  //   {"claude": "claude-account2", "codex": "codex-account1"}
+  // Deliberately separate from the viewed tab: reading an account's usage
+  // should not silently change which one `claude` runs. `d` moves it.
+  property var accountDefaults: ({})
+
+  FileView {
+    id: accountDefaultsFile
+    path: (Quickshell.env("XDG_STATE_HOME") || Quickshell.env("HOME") + "/.local/state") + "/omarchy/agents/defaults.json"
+    watchChanges: true
+    atomicWrites: true
+    printErrors: false
+    onFileChanged: reload()
+    onLoaded: {
+      try {
+        var parsed = JSON.parse(String(text() || "{}"))
+        root.accountDefaults = parsed && typeof parsed === "object" ? parsed : ({})
+      } catch (e) {
+        root.accountDefaults = ({})
+      }
+    }
+  }
+
+  // Provider ids are "<agent>-account<n>", so the agent is the leading segment.
+  function agentOf(providerId) {
+    var id = String(providerId || "")
+    var cut = id.indexOf("-")
+    return cut > 0 ? id.substring(0, cut) : id
+  }
+
+  // With only one account for an agent there is nothing to choose, so nothing
+  // is marked; the badge only earns its place once there is an alternative.
+  function agentHasChoice(agent) {
+    var seen = 0
+    for (var i = 0; i < root.providers.length; i++)
+      if (root.agentOf(root.providers[i].providerId) === agent) seen++
+    return seen > 1
+  }
+
+  function defaultForAgent(agent) {
+    var value = root.accountDefaults ? root.accountDefaults[agent] : ""
+    return String(value || "")
+  }
+
+  // An agent with no recorded default runs its first account.
+  function isDefaultAccount(providerId) {
+    var agent = root.agentOf(providerId)
+    if (!root.agentHasChoice(agent)) return false
+    var current = root.defaultForAgent(agent)
+    if (current !== "") return current === String(providerId)
+    return String(providerId) === agent + "-account1"
+  }
+
+  function makeViewedAccountDefault() {
+    if (!root.provider) return
+    var id = String(root.provider.providerId || "")
+    if (id === "") return
+    var next = {}
+    for (var key in root.accountDefaults) next[key] = root.accountDefaults[key]
+    next[root.agentOf(id)] = id
+    root.accountDefaults = next
+    accountDefaultsFile.setText(JSON.stringify(next, null, 2) + "\\n")
+  }
+  // --- end claude-profile account bridge ---
+'''
+
+MAIN_OLD = '    var command = ["omarchy-agent-usage-update"]'
+MAIN_NEW = (
+    '    // claude-profile: runs the stock updater, then the per-account collectors.\n'
+    '    var command = ["omarchy-agent-usage-all"]'
+)
+
+CHIP_OLD = "                text: modelData.providerName"
+CHIP_NEW = (
+    "                // A dot marks the account this agent's CLI starts.\n"
+    "                text: modelData.providerName"
+    " + (root.isDefaultAccount(modelData.providerId) ? \"  \\u25cf\" : \"\")"
+)
+
+KEY_OLD = '      onTextKey: function(t) { if (t === "r" || t === "R") root.refreshNow() }'
+KEY_NEW = (
+    "      onTextKey: function(t) {\n"
+    '        if (t === "r" || t === "R") root.refreshNow()\n'
+    '        else if (t === "d" || t === "D") root.makeViewedAccountDefault()\n'
+    "      }"
+)
+
+TOGGLE_ANCHOR = "          // ---------- Status ----------"
+
+# Deliberately not part of the switch row: that row is for reading another
+# account's usage, and moving between tabs must never change which account the
+# CLI starts. This is the only control that does, and it acts on whichever
+# account is on screen.
+TOGGLE_NEW = """          // ---------- claude-profile: default account (not upstream) ----------
+          Button {
+            id: defaultAccountToggle
+            readonly property string agent: root.provider ? root.agentOf(root.provider.providerId) : ""
+            readonly property bool isDefault: !!root.provider && root.isDefaultAccount(root.provider.providerId)
+
+            visible: !!root.provider && root.agentHasChoice(agent)
+            width: parent.width
+            text: isDefault ? "\u2713  Default for " + agent : "Make default for " + agent + "   d"
+            selected: isDefault
+            bordered: true
+            foreground: root.foreground
+            fontFamily: root.fontFamily
+            fontSize: Style.font.bodySmall
+            verticalPadding: Style.spacing.controlPaddingY
+            onClicked: root.makeViewedAccountDefault()
+          }
+
+"""
+
+
+def edit(path, old, new, what, sentinel):
+    """Replace one unique anchor, skipping if the edit is already present."""
+    source = path.read_text(encoding="utf-8")
+    if sentinel in source:
+        return True
+    if source.count(old) != 1:
+        print(f"agent-widget-patch: {what} anchor is not unique in {path.name}", file=sys.stderr)
+        return False
+    path.write_text(source.replace(old, new, 1), encoding="utf-8")
+    return True
+
+
+def main() -> int:
+    if len(sys.argv) != 2:
+        print("usage: agent-widget-patch <plugin-dir>", file=sys.stderr)
+        return 2
+
+    root = pathlib.Path(sys.argv[1])
+    if not root.is_dir():
+        print(f"agent-widget-patch: not a directory: {root}", file=sys.stderr)
+        return 1
+
+    panel = root / "Panel.qml"
+    main_qml = root / "Main.qml"
+    for path in (panel, main_qml):
+        if not path.is_file():
+            print(f"agent-widget-patch: no such file: {path}", file=sys.stderr)
+            return 1
+
+    # The bridge needs the property it mirrors and the imports it uses; if
+    # upstream ever renames them, fail loudly rather than write dead QML.
+    source = panel.read_text(encoding="utf-8")
+    if MARKER not in source:
+        for needed in ("property string selectedProviderId", "import Quickshell.Io", "import Quickshell"):
+            if needed not in source:
+                print(f"agent-widget-patch: Panel.qml has no '{needed}'", file=sys.stderr)
+                return 1
+
+    ok = edit(panel, PANEL_ANCHOR, PANEL_ANCHOR + "\n" + PANEL_BRIDGE, "cursorActive", MARKER + " account bridge")
+    ok = edit(panel, CHIP_OLD, CHIP_NEW, "chip text", "isDefaultAccount(modelData.providerId)") and ok
+    ok = edit(panel, KEY_OLD, KEY_NEW, "text key", "makeViewedAccountDefault()\n      }") and ok
+    ok = edit(panel, TOGGLE_ANCHOR, TOGGLE_NEW + TOGGLE_ANCHOR, "status section", "defaultAccountToggle") and ok
+    ok = edit(main_qml, MAIN_OLD, MAIN_NEW, "updater command", "omarchy-agent-usage-all") and ok
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

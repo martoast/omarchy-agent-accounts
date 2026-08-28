@@ -1,0 +1,3 @@
+#!/bin/bash
+# Manage claude accounts. Thin wrapper around agent-profile.
+AGENT_KIND=claude exec agent-profile "$@"
