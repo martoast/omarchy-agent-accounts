@@ -6,6 +6,28 @@
 
 set -euo pipefail
 
+# `codex --account 2` (or `--account=2`, `--account account2`) picks an
+# account explicitly, exactly like `codex2`. The flag is ours, not the CLI's,
+# so strip it before anything reaches the real binary. An explicit choice wins
+# over both the widget selection and a nested-call stay-put.
+account=""
+args=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --account)
+      [[ $# -ge 2 ]] || { echo "codex: --account needs a value (1, 2, account2, …)" >&2; exit 2; }
+      account=$2; shift 2 ;;
+    --account=*)
+      account=${1#--account=}; shift ;;
+    *)
+      args+=("$1"); shift ;;
+  esac
+done
+set -- "${args[@]+"${args[@]}"}"
+if [[ -n $account ]]; then
+  exec codex-profile run "$account" "$@"
+fi
+
 # Already inside an account: a nested call (the agent running a command that
 # invokes it again) must stay on the account that started it, not jump to
 # whatever the widget is showing now.
@@ -16,4 +38,4 @@ fi
 # Anything unexpected here would strand the user without a CLI, so a broken
 # selection falls back to account1 rather than failing.
 account=$(codex-profile selected 2>/dev/null || echo account1)
-exec codex-profile run "$account" "$@"
+exec node /home/alex/mcp-servers/agent-bridge/launch-root.mjs codex-main codex -- codex-profile run "$account" "$@"

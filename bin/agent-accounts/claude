@@ -6,6 +6,41 @@
 
 set -euo pipefail
 
+# Claude Code's native installer no longer exposes an `update` subcommand on
+# mise-managed installs. Preserve the familiar command without starting an
+# agent session or routing the word "update" into Claude as a prompt.
+if [[ ${1:-} == update || ${1:-} == --update ]]; then
+  shift
+  latest_claude=$(mise ls-remote claude --minimum-release-age 0s | tail -n 1)
+  [[ $latest_claude =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+    echo "claude update: could not resolve the newest concrete Claude Code version" >&2
+    exit 1
+  }
+  exec mise use -g --pin "claude@$latest_claude" "$@"
+fi
+
+# `claude --account 2` (or `--account=2`, `--account account2`) picks an
+# account explicitly, exactly like `claude2`. The flag is ours, not the CLI's,
+# so strip it before anything reaches the real binary. An explicit choice wins
+# over both the widget selection and a nested-call stay-put.
+account=""
+args=()
+while [[ $# -gt 0 ]]; do
+  case $1 in
+    --account)
+      [[ $# -ge 2 ]] || { echo "claude: --account needs a value (1, 2, account2, …)" >&2; exit 2; }
+      account=$2; shift 2 ;;
+    --account=*)
+      account=${1#--account=}; shift ;;
+    *)
+      args+=("$1"); shift ;;
+  esac
+done
+set -- "${args[@]+"${args[@]}"}"
+if [[ -n $account ]]; then
+  exec claude-profile run "$account" "$@"
+fi
+
 # Already inside an account: a nested call (the agent running a command that
 # invokes it again) must stay on the account that started it, not jump to
 # whatever the widget is showing now.
@@ -16,4 +51,4 @@ fi
 # Anything unexpected here would strand the user without a CLI, so a broken
 # selection falls back to account1 rather than failing.
 account=$(claude-profile selected 2>/dev/null || echo account1)
-exec claude-profile run "$account" "$@"
+exec node /home/alex/mcp-servers/agent-bridge/launch-root.mjs claude-main claude -- claude-profile run "$account" "$@"

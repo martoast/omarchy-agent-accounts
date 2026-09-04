@@ -17,8 +17,9 @@ Weekly (7-day)                       17%
 ```
 
 - **One tab per account**, each with its own live rate limits.
-- `claude1`, `claude2`, `codex1` … run a specific account. They are ordinary
-  processes, so **two accounts can run side by side**, one terminal each.
+- `claude1`, `claude2`, `codex1` … run a specific account, and so does
+  `claude --account 2` (or `--account=2`). They are ordinary processes, so
+  **two accounts can run side by side**, one terminal each.
 - A bare `claude` or `codex` runs whichever account is marked default.
 - The default is set from the widget — a dot marks it, and a button under the
   tabs moves it. Browsing another account's usage does not change it.
@@ -99,6 +100,7 @@ which makes that menu the reminder of which key opens which account.
 
 ```
 claude1, claude2, codex1 …      run a specific account
+claude --account 2, codex --account 1   same thing as a flag (also --account=2)
 claude, codex                   run the default account
 
 <cli>-profile list              accounts, emails, plans, which is default
