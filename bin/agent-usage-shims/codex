@@ -29,5 +29,5 @@ while [[ $# -gt 0 ]]; do
 done
 
 self_dir="$HOME/.local/bin/agent-usage-shims"
-filtered=$(echo "$PATH" | tr ':' '\n' | grep -vxF "$self_dir" | paste -sd:)
+filtered=$(echo "$PATH" | tr ':' '\n' | grep -vxF "$self_dir" | paste -sd: -)
 exec env PATH="$filtered" codex "${args[@]+"${args[@]}"}"

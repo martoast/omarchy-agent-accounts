@@ -249,8 +249,30 @@ link_shared() {
       ln -s "$source" "$target"
     done
     ((SHARE_MEMORY)) && link_memory "$name"
+    [[ $AGENT == claude ]] && sync_mcp_servers "$name"
   fi
   link_widget_icon "$name"
+}
+
+# User-scope MCP servers live in each account's own .claude.json, which can't
+# be a symlink (it also holds that account's login metadata). Copy account1's
+# servers in; same-named entries take account1's definition, and servers only
+# this account has are kept.
+sync_mcp_servers() {
+  local name="$1" source target tmp
+  source=$(claude_state_file account1)
+  target=$(claude_state_file "$name")
+  [[ -f $source && -f $target ]] || return 0
+  [[ $(jq '.mcpServers // {} | length' "$source") -gt 0 ]] || return 0
+  tmp=$(mktemp "$target.XXXXXX")
+  if jq --slurpfile src "$source" '.mcpServers = ((.mcpServers // {}) + ($src[0].mcpServers // {}))' \
+    "$target" >"$tmp"; then
+    chmod --reference="$target" "$tmp" 2>/dev/null || chmod 600 "$tmp"
+    mv -f "$tmp" "$target"
+  else
+    rm -f "$tmp"
+    echo "$CLI-profile: could not sync MCP servers into $name" >&2
+  fi
 }
 
 # Memory lives under projects/<slug>/memory, and projects/ has to stay
