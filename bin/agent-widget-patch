@@ -2,12 +2,14 @@
 """Apply the account-management patches to a cloned Omarchy agents plugin.
 
 None of this can live in the packaged plugin, because /usr/share/omarchy is
-read-only and replaced on every update. Four small, separately anchored edits:
+read-only and replaced on every update. Small, separately anchored edits:
 
   Panel.qml  a bridge between the panel and two state files: the tab being
              viewed, and the default account each CLI starts. Adds a `d` key
              to move the default, a dot on the default account's chip, and a
-             line under the hero saying which is which.
+             line under the hero saying which is which. Keeps a runtime-ready
+             setup-token account visible even before its separate usage login,
+             and shows account identity and auth mode in the hero.
 
   Main.qml   route the refresh through omarchy-agent-usage-all, so extra
              accounts regenerate on the same timer and the same refresh key
@@ -120,6 +122,26 @@ MAIN_NEW = (
     '    var command = ["omarchy-agent-usage-all"]'
 )
 
+HAS_DATA_OLD = "      || !!p.balance"
+HAS_DATA_NEW = "      || !!p.balance || p.profileConnected === true"
+
+DISPLAY_AUTH_OLD = '      authHelpText: String(record.authHelpText || ""),'
+DISPLAY_AUTH_NEW = '''      authHelpText: String(record.authHelpText || ""),
+      accountEmail: String(record.accountEmail || ""),
+      authMode: String(record.authMode || ""),
+      profileConnected: record.profileConnected === true,
+      usageConnected: record.usageConnected === true,'''
+
+HERO_OLD = '''    var tier = String(p.tierLabel || "")
+    if (tier === "") return "Subscription"
+    return tier.charAt(0).toUpperCase() + tier.slice(1)'''
+HERO_NEW = '''    var details = []
+    if (String(p.accountEmail || "") !== "") details.push(String(p.accountEmail))
+    var tier = String(p.tierLabel || "")
+    if (tier !== "") details.push(tier.charAt(0).toUpperCase() + tier.slice(1))
+    else if (String(p.authMode || "") !== "") details.push(String(p.authMode))
+    return details.length > 0 ? details.join(" · ") : "Subscription"'''
+
 CHIP_OLD = "                text: modelData.providerName"
 CHIP_NEW = (
     "                // A dot marks the account this agent's CLI starts.\n"
@@ -205,6 +227,9 @@ def main() -> int:
     ok = edit(panel, KEY_OLD, KEY_NEW, "text key", "makeViewedAccountDefault()\n      }") and ok
     ok = edit(panel, TOGGLE_ANCHOR, TOGGLE_NEW + TOGGLE_ANCHOR, "status section", "defaultAccountToggle") and ok
     ok = edit(main_qml, MAIN_OLD, MAIN_NEW, "updater command", "omarchy-agent-usage-all") and ok
+    ok = edit(main_qml, HAS_DATA_OLD, HAS_DATA_NEW, "connected profile visibility", "p.profileConnected === true") and ok
+    ok = edit(main_qml, DISPLAY_AUTH_OLD, DISPLAY_AUTH_NEW, "account auth fields", "accountEmail: String(record.accountEmail") and ok
+    ok = edit(panel, HERO_OLD, HERO_NEW, "hero account info", "details.join(\" · \")") and ok
     return 0 if ok else 1
 
 

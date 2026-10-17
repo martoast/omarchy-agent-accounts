@@ -128,7 +128,11 @@ codex_email() {
 
 profile_email() {
   case "$AGENT" in
-  claude) json_field "$(claude_state_file "$1")" '.oauthAccount.emailAddress' ;;
+  # A setup-token is inference-only and `claude auth status --json` does not
+  # expose its email. Do not display stale /login metadata as the token owner.
+  claude)
+    [[ -s $(profile_dir "$1")/.setup-token ]] || json_field "$(claude_state_file "$1")" '.oauthAccount.emailAddress'
+    ;;
   codex) codex_email "$1" ;;
   esac
 }
@@ -138,6 +142,10 @@ profile_email() {
 profile_plan() {
   local record="$STATE_DIR/usage/$(provider_id "$1").json" tier sub creds
   if [[ $AGENT == "claude" ]]; then
+    if [[ -s $(profile_dir "$1")/.setup-token ]]; then
+      echo "OAuth 1y"
+      return 0
+    fi
     creds="$(profile_dir "$1")/.credentials.json"
     tier=$(json_field "$creds" '.claudeAiOauth.rateLimitTier')
     sub=$(json_field "$creds" '.claudeAiOauth.subscriptionType')
@@ -155,6 +163,9 @@ profile_plan() {
 
 profile_logged_in() {
   local creds="$(profile_dir "$1")/$CREDS_FILE"
+  if [[ $AGENT == claude && -s $(profile_dir "$1")/.setup-token ]]; then
+    return 0
+  fi
   [[ -s $creds ]] || return 1
   case "$AGENT" in
   claude) [[ -n $(json_field "$creds" '.claudeAiOauth.accessToken') ]] ;;
@@ -341,48 +352,156 @@ cmd_link() {
 
 cmd_run() {
   local name
+  local -a credential_env=()
   name=$(normalize_name "${1:-}")
   shift
+  # Claude is installed and versioned by mise, and current Claude Code builds
+  # no longer expose their old native `update` command. Keep `claude1 update`
+  # and explicit `claude-profile run <n> update` consistent with bare
+  # `claude update`, without opening a bridge/tmux agent session.
+  # Without mise, `update` falls through to the CLI itself.
+  if [[ $AGENT == claude && ( ${1:-} == update || ${1:-} == --update ) ]] && command -v mise >/dev/null; then
+    shift
+    local latest_claude
+    latest_claude=$(mise ls-remote claude --minimum-release-age 0s | tail -n 1)
+    [[ $latest_claude =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "could not resolve the newest concrete Claude Code version"
+    exec mise use -g --pin "claude@$latest_claude" "$@"
+  fi
   local dir
   dir=$(profile_dir "$name")
   [[ -d $dir ]] || fail "no such account: $name (try: $CLI-profile add $(account_number "$name"))"
+  # A numbered Codex profile must be pinned to its own stored credential.
+  # Inherited process tokens take precedence over stored login in some modes
+  # and would silently make two CODEX_HOME directories use one account.
+  [[ $AGENT == codex ]] && credential_env=(-u OPENAI_API_KEY -u CODEX_ACCESS_TOKEN)
+  if [[ $AGENT == claude ]]; then
+    credential_env=(
+      -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN
+      -u CLAUDE_CODE_OAUTH_TOKEN -u CLAUDE_CODE_OAUTH_REFRESH_TOKEN -u CLAUDE_CODE_OAUTH_SCOPES
+      "CLAUDE_SETUP_TOKEN_FILE=$dir/.setup-token"
+    )
+    REAL_CLI=claude-profile-exec
+  fi
+
+  # Every manually launched root agent must be wake-capable, regardless of
+  # whether it came from bare `codex`/`claude`, a numbered launcher, or an
+  # explicit profile run. The bare dispatchers are already wrapped before they
+  # reach here; this closes the numbered/profile path. Assigned children and
+  # commands already inside tmux must never be wrapped again.
+  # agent-bridge is optional; without it the profile runs directly.
+  if [[ -z ${TMUX:-} && -z ${AGENT_BRIDGE_ID:-} && -f $HOME/mcp-servers/agent-bridge/launch-root.mjs ]] &&
+    command -v node >/dev/null; then
+    exec node "$HOME/mcp-servers/agent-bridge/launch-root.mjs" "$AGENT-$name" "$AGENT" -- "$CLI-profile" run "$name" "$@"
+  fi
 
   # AGENT_ACCOUNT tells the dispatcher that this process already belongs to an
   # account, so a nested call inside a session stays on the one that started it.
   if is_primary "$name"; then
     # account1 is the CLI's own default layout: pointing the home variable at
     # it would relocate state the CLI keeps outside that directory.
-    exec env -u "$HOME_VAR" "${AGENT^^}_ACCOUNT=$(account_number "$name")" "$REAL_CLI" "$@"
+    #
+    # `-u "$HOME_VAR"` MUST come before credential_env: GNU env stops treating
+    # arguments as options at the first NAME=VALUE operand, and claude's
+    # credential_env ends with the CLAUDE_SETUP_TOKEN_FILE=... assignment. With
+    # the unset flag after it, env parsed `-u` as the command name and died with
+    # `env: '-u': No such file or directory` (exit 127) — which broke every bare
+    # `claude` on account1.
+    exec env -u "$HOME_VAR" "${credential_env[@]}" "${AGENT^^}_ACCOUNT=$(account_number "$name")" "$REAL_CLI" "$@"
   fi
-  exec env "$HOME_VAR=$dir" "${AGENT^^}_ACCOUNT=$(account_number "$name")" "$REAL_CLI" "$@"
+  exec env "${credential_env[@]}" "$HOME_VAR=$dir" "${AGENT^^}_ACCOUNT=$(account_number "$name")" "$REAL_CLI" "$@"
 }
 
 cmd_login() {
   local name
+  local -a credential_env=()
   name=$(normalize_name "${1:-1}")
+  [[ $# -gt 0 ]] && shift || true
   local dir
   dir=$(profile_dir "$name")
   [[ -d $dir ]] || fail "no such account: $name"
-  if is_primary "$name"; then
-    env -u "$HOME_VAR" "$REAL_CLI" "${LOGIN_ARGS[@]}"
+  if [[ $AGENT == codex ]]; then
+    credential_env=(-u OPENAI_API_KEY -u CODEX_ACCESS_TOKEN)
   else
-    env "$HOME_VAR=$dir" "$REAL_CLI" "${LOGIN_ARGS[@]}"
+    # A saved setup token deliberately wins when Claude runs, but it must not
+    # make `auth login` think this profile is already authenticated. This
+    # login is the separate OAuth lane used by the Omarchy usage widget.
+    credential_env=(
+      -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN
+      -u CLAUDE_CODE_OAUTH_TOKEN -u CLAUDE_CODE_OAUTH_REFRESH_TOKEN -u CLAUDE_CODE_OAUTH_SCOPES
+      -u CLAUDE_SETUP_TOKEN_FILE
+    )
+  fi
+  if is_primary "$name"; then
+    # Unset flags before credential_env: GNU env stops parsing options at the
+    # first NAME=VALUE operand (see cmd_run for the failure this prevents).
+    env -u "$HOME_VAR" "${credential_env[@]}" "$REAL_CLI" "${LOGIN_ARGS[@]}" "$@"
+  else
+    env "${credential_env[@]}" "$HOME_VAR=$dir" "$REAL_CLI" "${LOGIN_ARGS[@]}" "$@"
   fi
   echo
   cmd_list
 }
 
+cmd_usage_login() {
+  [[ $AGENT == claude ]] || fail "usage-login is available only for Claude profiles"
+  local name
+  name=$(normalize_name "${1:-1}")
+  [[ $# -gt 0 ]] && shift || true
+  echo "Connecting $(display_name "$name") for limits and account info."
+  echo "Its saved one-year runtime token will remain installed and keep taking precedence."
+  cmd_login "$name" "$@"
+  cmd_usage --force
+}
+
 cmd_logout() {
   local name
+  local -a credential_env=()
   name=$(normalize_name "${1:-}")
   local dir
   dir=$(profile_dir "$name")
   [[ -d $dir ]] || fail "no such account: $name"
-  if is_primary "$name"; then
-    env -u "$HOME_VAR" "$REAL_CLI" "${LOGOUT_ARGS[@]}"
-  else
-    env "$HOME_VAR=$dir" "$REAL_CLI" "${LOGOUT_ARGS[@]}"
+  if [[ $AGENT == claude && -f $dir/.setup-token ]]; then
+    rm -f -- "$dir/.setup-token"
+    echo "Removed $name's saved long-lived token."
   fi
+  [[ $AGENT == codex ]] && credential_env=(-u OPENAI_API_KEY -u CODEX_ACCESS_TOKEN)
+  if is_primary "$name"; then
+    # Unset flags before credential_env: GNU env stops parsing options at the
+    # first NAME=VALUE operand (see cmd_run for the failure this prevents).
+    env -u "$HOME_VAR" "${credential_env[@]}" "$REAL_CLI" "${LOGOUT_ARGS[@]}"
+  else
+    env "${credential_env[@]}" "$HOME_VAR=$dir" "$REAL_CLI" "${LOGOUT_ARGS[@]}"
+  fi
+}
+
+cmd_setup_token() {
+  [[ $AGENT == claude ]] || fail "setup-token is available only for Claude profiles"
+  local name dir token_file token
+  name=$(normalize_name "${1:-}")
+  dir=$(profile_dir "$name")
+  [[ -d $dir ]] || fail "no such account: $name"
+  token_file="$dir/.setup-token"
+
+  echo "Claude will open OAuth and print a one-year token."
+  echo "Copy that token; after the generator exits, paste it into the hidden prompt."
+  if is_primary "$name"; then
+    env -u CLAUDE_CONFIG_DIR -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+      -u CLAUDE_CODE_OAUTH_TOKEN -u CLAUDE_CODE_OAUTH_REFRESH_TOKEN -u CLAUDE_CODE_OAUTH_SCOPES \
+      claude-real setup-token
+  else
+    env -u ANTHROPIC_API_KEY -u ANTHROPIC_AUTH_TOKEN \
+      -u CLAUDE_CODE_OAUTH_TOKEN -u CLAUDE_CODE_OAUTH_REFRESH_TOKEN -u CLAUDE_CODE_OAUTH_SCOPES \
+      CLAUDE_CONFIG_DIR="$dir" \
+      claude-real setup-token
+  fi
+  read -r -s -p "Paste the token for $name: " token
+  echo
+  [[ -n $token && $token != *[[:space:]]* && ${#token} -le 16384 ]] || fail "token is empty or malformed"
+  umask 077
+  printf '%s\n' "$token" >"$token_file"
+  chmod 600 "$token_file"
+  unset token
+  echo "Saved $name's long-lived token privately at $token_file"
 }
 
 cmd_list() {
@@ -409,7 +528,8 @@ cmd_usage() {
 }
 
 cmd_doctor() {
-  local name dir item target problems=0 clone num
+  local name dir item target problems=0 clone num email signed_in
+  declare -A email_owner=()
   echo "$LABEL account1: $PRIMARY_DIR"
   clone=$(agents_clone_dir) || { echo "  no cloned agents widget found"; problems=$((problems + 1)); }
   while read -r name; do
@@ -428,14 +548,45 @@ cmd_doctor() {
           problems=$((problems + 1))
         fi
       done
+      if [[ $AGENT == codex && -e $dir/auth.json && $dir/auth.json -ef $PRIMARY_DIR/auth.json ]]; then
+        echo "  $name: auth.json aliases account1; credentials must be independent"
+        problems=$((problems + 1))
+      fi
+    fi
+    if [[ $AGENT == claude && -e $dir/.setup-token ]]; then
+      local token_mode token_owner
+      token_mode=$(stat -c '%a' "$dir/.setup-token")
+      token_owner=$(stat -c '%u' "$dir/.setup-token")
+      if [[ $token_owner != "$(id -u)" || $((8#$token_mode & 8#077)) -ne 0 ]]; then
+        echo "  $name: .setup-token must be owned by you and mode 600"
+        problems=$((problems + 1))
+      fi
     fi
     [[ -x $BIN_DIR/$CLI$num ]] || { echo "  $name: launcher $CLI$num is missing"; problems=$((problems + 1)); }
     if [[ -n ${clone:-} && -f $clone/assets/$AGENT.svg && ! -e $clone/assets/$(provider_id "$name").svg ]]; then
       echo "  $name: widget icon alias is missing"
       problems=$((problems + 1))
     fi
-    profile_logged_in "$name" || { echo "  $name: not signed in"; problems=$((problems + 1)); }
+    if profile_logged_in "$name"; then
+      signed_in=1
+    else
+      signed_in=0
+      echo "  $name: not signed in"
+      problems=$((problems + 1))
+    fi
+    email=$(profile_email "$name" || true)
+    if ((signed_in)) && [[ -n $email && -n ${email_owner[$email]:-} ]]; then
+      echo "  $name: signed into the same account as ${email_owner[$email]} ($email); this is not an independent subscription/quota"
+      problems=$((problems + 1))
+    elif ((signed_in)) && [[ -n $email ]]; then
+      email_owner[$email]="$name"
+    fi
   done < <(all_profiles)
+
+  if [[ $AGENT == codex ]] && ! grep -Eq '^cli_auth_credentials_store[[:space:]]*=[[:space:]]*"file"' "$PRIMARY_DIR/config.toml" 2>/dev/null; then
+    echo "  Codex must use cli_auth_credentials_store = \"file\" for independent CODEX_HOME accounts"
+    problems=$((problems + 1))
+  fi
 
   [[ -x $BIN_DIR/$REAL_CLI ]] || { echo "  $REAL_CLI is missing"; problems=$((problems + 1)); }
   [[ -x $DISPATCH_DIR/$CLI ]] || { echo "  dispatcher $DISPATCH_DIR/$CLI is missing"; problems=$((problems + 1)); }
@@ -524,7 +675,9 @@ Run several $LABEL accounts side by side, each with its own limits.
   $CLI-profile selected        Print the selected account
   $CLI-profile add <n>         Create an account and sign it in
   $CLI-profile run <n> [args]  Run $LABEL as that account
-  $CLI-profile login <n>       Sign an account in (or back in)
+  $CLI-profile login <n> [...] Sign an account in; Claude accepts --email/--sso/--console, Codex accepts --device-auth
+  $CLI-profile setup-token <n> Generate and privately save a one-year Claude token
+  $CLI-profile usage-login <n> Connect Claude limits/info without replacing its one-year token
   $CLI-profile logout <n>      Sign an account out
   $CLI-profile link <n>        Repair shared config
   $CLI-profile doctor          Check the whole setup
@@ -547,7 +700,9 @@ selected | current) cmd_selected "$@" ;;
 add | new) cmd_add "$@" ;;
 run | exec) cmd_run "$@" ;;
 login) cmd_login "$@" ;;
+usage-login) cmd_usage_login "$@" ;;
 logout) cmd_logout "$@" ;;
+setup-token | token) cmd_setup_token "$@" ;;
 link | relink) cmd_link "$@" ;;
 relink-icons) cmd_relink_icons "$@" ;;
 doctor | check) cmd_doctor "$@" ;;

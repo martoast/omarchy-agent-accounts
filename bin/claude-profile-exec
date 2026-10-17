@@ -1,0 +1,23 @@
+#!/bin/bash
+# Load one profile's private long-lived OAuth token without exposing it in the
+# process command line, then execute the real Claude CLI.
+set -euo pipefail
+
+token_file=${CLAUDE_SETUP_TOKEN_FILE:-}
+unset ANTHROPIC_API_KEY ANTHROPIC_AUTH_TOKEN CLAUDE_CODE_OAUTH_TOKEN
+unset CLAUDE_CODE_OAUTH_REFRESH_TOKEN CLAUDE_CODE_OAUTH_SCOPES
+
+if [[ -n $token_file && -f $token_file ]]; then
+  mode=$(stat -c '%a' "$token_file")
+  owner=$(stat -c '%u' "$token_file")
+  [[ $owner == "$(id -u)" ]] || { echo "claude-profile-exec: token file is not owned by the current user" >&2; exit 1; }
+  (( (8#$mode & 8#077) == 0 )) || { echo "claude-profile-exec: token file must not be accessible by group/other" >&2; exit 1; }
+  IFS= read -r CLAUDE_CODE_OAUTH_TOKEN <"$token_file"
+  [[ -n $CLAUDE_CODE_OAUTH_TOKEN && $CLAUDE_CODE_OAUTH_TOKEN != *[[:space:]]* ]] || {
+    echo "claude-profile-exec: token file is empty or malformed" >&2
+    exit 1
+  }
+  export CLAUDE_CODE_OAUTH_TOKEN
+fi
+
+exec claude-real "$@"

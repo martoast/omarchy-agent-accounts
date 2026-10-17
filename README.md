@@ -107,6 +107,8 @@ claude, codex                   run the default account
 <cli>-profile use <n>           set the default from the shell
 <cli>-profile add <n>           create an account and sign it in
 <cli>-profile login <n>         sign an account in (or back in)
+claude-profile setup-token <n>  save a one-year run token for that account
+claude-profile usage-login <n>  /login for limits/email only; the token still runs Claude
 <cli>-profile link <n>          repair shared config and launchers
 <cli>-profile doctor            check the whole setup
 <cli>-profile widget-sync       re-sync the widget clone from upstream
@@ -128,6 +130,21 @@ keybinding — which runs with no shell — should call `claude-account` or
 `CODEX_ACCOUNT`; the dispatcher honours it, so an agent that shells out to
 itself stays on the account that started it rather than jumping to whatever
 the widget is showing.
+
+**Claude accounts can run on a one-year token.** `claude-profile setup-token
+<n>` saves the output of `claude setup-token` to `<account dir>/.setup-token`
+(mode 600). `run` clears inherited `ANTHROPIC_*` / `CLAUDE_CODE_OAUTH_*`
+variables and goes through `claude-profile-exec`, which checks the file's owner
+and mode and passes the token as `CLAUDE_CODE_OAUTH_TOKEN` — never on a command
+line. That token is inference-only, so the widget still needs an ordinary
+`/login` (`usage-login`). The token file can be copied to another machine over
+ssh stdin; `.credentials.json` should not be, because its refresh token rotates
+and two machines would log each other out.
+
+**agent-bridge and mise are optional.** When
+`~/mcp-servers/agent-bridge/launch-root.mjs` exists, launches go through it;
+otherwise the account runs directly. `claude update` uses mise only if it is
+installed.
 
 **Token charts are local; limit meters are not.** "Tokens by day" and "Tokens
 by model" are scanned from transcripts on this machine and include cache-read

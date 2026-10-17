@@ -9,7 +9,7 @@ set -euo pipefail
 BIN="$HOME/.local/bin"
 
 echo "Removing launchers from $BIN"
-rm -f "$BIN"/{agent-profile,claude-profile,codex-profile,claude-real,codex-real}
+rm -f "$BIN"/{agent-profile,claude-profile,codex-profile,claude-real,codex-real,claude-profile-exec}
 rm -f "$BIN"/{claude-account,codex-account,agent-widget-patch}
 rm -f "$BIN"/{omarchy-agent-usage-all,omarchy-agent-usage-profiles}
 rm -rf "$BIN/agent-accounts" "$BIN/agent-usage-shims"

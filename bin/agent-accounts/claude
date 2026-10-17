@@ -51,4 +51,9 @@ fi
 # Anything unexpected here would strand the user without a CLI, so a broken
 # selection falls back to account1 rather than failing.
 account=$(claude-profile selected 2>/dev/null || echo account1)
-exec node /home/alex/mcp-servers/agent-bridge/launch-root.mjs claude-main claude -- claude-profile run "$account" "$@"
+# agent-bridge is optional: machines without it run the account directly.
+launch_root="$HOME/mcp-servers/agent-bridge/launch-root.mjs"
+if [[ -f $launch_root ]] && command -v node >/dev/null; then
+  exec node "$launch_root" claude-main claude -- claude-profile run "$account" "$@"
+fi
+exec claude-profile run "$account" "$@"
